@@ -60,6 +60,14 @@ object LiveUpdateNotifier {
     private const val LOCKSCREEN_CONTENT_HIDDEN_TEXT = "Content hidden"
 
     private val OTP_CODE_LENGTH = 4..8
+
+    // Max character distance a "bare" numeric candidate (one not textually anchored
+    // to a trigger word by its own regex, e.g. a plain 6-digit run) is allowed to be
+    // from the nearest OTP trigger word/phrase. Beyond this it's treated as unrelated
+    // noise (balances, phone numbers, order ids, dates, etc.) rather than a code, even
+    // if it happens to be the only numeric match in the notification.
+    private const val OTP_BARE_CANDIDATE_MAX_TRIGGER_DISTANCE = 48
+
     private val NATIVE_IN_CALL_PACKAGES = setOf(
         "com.samsung.android.incallui",
         "com.samsung.android.dialer",
@@ -2344,10 +2352,16 @@ object LiveUpdateNotifier {
         source: Notification,
         parserDictionary: LiveParserDictionary
     ): OtpMatch? {
+        // includeRemoteViewTexts = true is required here: several OEM messaging apps
+        // (notably Samsung's stock Messages app on One UI) render their notifications
+        // with a custom RemoteViews layout instead of populating the standard
+        // EXTRA_TEXT / EXTRA_BIG_TEXT / EXTRA_MESSAGES extras. Without this, the OTP
+        // scanner never sees any text at all for those notifications and silently
+        // fails to detect codes that are visibly right there on screen.
         val combinedText = collectNotificationText(
             notification = source,
             fallbackTitle = packageName,
-            includeRemoteViewTexts = false
+            includeRemoteViewTexts = true
         )
         if (combinedText.isBlank()) {
             return null
@@ -2396,6 +2410,31 @@ object LiveUpdateNotifier {
                     !hasStrongTrigger
                 ) {
                     continue
+                }
+
+                // Patterns like "(?<!\S)(\d{4,8})(?!\d)" match ANY standalone number in
+                // the notification and rely purely on a trigger word existing somewhere
+                // in the text (checked above via hasStrongTrigger/hasLooseTrigger). That
+                // trigger word could be hundreds of characters away from this particular
+                // number (e.g. an account balance, a phone number, an order id in a long
+                // bank SMS). Previously such far-away numbers were merely down-scored,
+                // which meant they could still be selected as the "best" (only) candidate
+                // and get copied as a bogus OTP whenever the real code failed to match.
+                // "Anchored" patterns (where the trigger word itself is part of the same
+                // regex match, e.g. "otp is 123456") are exempt since proximity is already
+                // guaranteed by construction.
+                val isBarePattern = valueRange == match.range
+                if (isBarePattern) {
+                    val nearestTrigger = triggerRanges.minOfOrNull { triggerRange ->
+                        when {
+                            valueRange.last + 1 <= triggerRange.first -> triggerRange.first - (valueRange.last + 1)
+                            valueRange.first > triggerRange.last -> valueRange.first - triggerRange.last - 1
+                            else -> 0
+                        }
+                    }
+                    if (nearestTrigger == null || nearestTrigger > OTP_BARE_CANDIDATE_MAX_TRIGGER_DISTANCE) {
+                        continue
+                    }
                 }
 
                 val candidate = OtpCandidate(
